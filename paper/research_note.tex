@@ -1,0 +1,390 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage[margin=1in]{geometry}
+\usepackage{natbib}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{subcaption}
+\usepackage{enumitem}
+\usepackage{multirow}
+
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+
+\title{Disambiguation Lag in Raga Sequence Modeling:\\
+\large A Mechanistic Study of Non-Local Dependency Learning in Transformers}
+
+\author{Mihir Sahasrabudhe}
+
+\date{March 2026 \\ \small Research Note --- Draft v1}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We investigate whether disambiguation lag---the delayed learning of disambiguating information in autoregressive transformers---generalizes from synthetic lookup tasks to a structured musical substrate. Using sequences generated from Indian classical Raga grammars, we design a two-phase experiment. Phase~1 tests whether a hierarchical phrase grammar (with aroha, avaroha, pakad, and vadi rules) produces output requiring hierarchical representations. It does not: the generator's output is well-approximated by a mixture of weakly-distinguishable Markov chains, and the model learns to identify mixture components smoothly without any phase transition. Phase~2 embeds an explicit non-Markovian dependency---pakad-response pairs separated by an uninformative buffer of 12--18 tokens---creating a provable bottleneck of 1.56~nats that no $k$-gram model ($k \leq 5$) can resolve. Here, disambiguation lag appears clearly: response-first-token loss plateaus 0.55~nats above all other token types for ${\sim}1500$ training steps before collapsing when a single attention head (Layer~3, Head~1) wires up the non-local circuit from response position back to pakad position. This confirms that disambiguation lag is a general property of gradient-based learning of non-local dependencies, not an artifact of the specific synthetic task where it was first observed. We discuss implications for the Shannon-to-Kolmogorov transition hypothesis and identify precise conditions under which hierarchical generator structure does and does not survive into the output distribution.
+\end{abstract}
+
+\section{Introduction}
+
+When training autoregressive transformers on tasks where a disambiguating variable $z$ must be used to resolve ambiguity in the input, there is a characteristic \emph{lag}: the model learns the marginal distribution $P(A \mid B)$ before learning the conditional $P(A \mid B, z)$, even though $z$ is present in the input from the first training step \citep{sahasrabudhe2026late}. This lag manifests as a plateau in the loss curve, with the plateau duration scaling logarithmically with the number of candidates $K$ that $z$ must disambiguate among---a relationship we have previously connected to Landauer's principle from statistical thermodynamics.
+
+A natural question is whether this phenomenon is specific to the synthetic $(B, z) \to A$ task or reflects a general property of how gradient-based optimization discovers non-local dependencies. To test generality, we need a substrate where:
+\begin{enumerate}[nosep]
+    \item The token vocabulary and transition structure differ fundamentally from random character strings.
+    \item The non-local dependency arises naturally from the domain structure, not from explicit construction.
+    \item The ``disambiguation'' has a meaningful interpretation beyond lookup-table retrieval.
+\end{enumerate}
+
+Indian classical Raga music provides a candidate substrate. A Raga is a melodic framework defined by hierarchical rules: which notes (\emph{swaras}) are permitted, how they may be ordered in ascent (\emph{aroha}) and descent (\emph{avaroha}), which note receives emphasis (\emph{vadi}), and which characteristic phrases (\emph{pakad}) establish the Raga's identity. These rules form a compact generative grammar---a Kolmogorov program---that produces long token sequences. The question is whether a transformer trained on such sequences must discover this hierarchical structure, or whether simpler statistical models suffice.
+
+This note reports a two-phase experiment. Phase~1 tests a hierarchical Raga generator and finds that its output is capturable by a mixture of Markov chains---a negative result that precisely characterizes when hierarchical generator structure does \emph{not} produce hierarchical output distributions. Phase~2 redesigns the generator to embed a provably non-Markovian dependency and successfully reproduces disambiguation lag, confirming the phenomenon's generality while identifying the specific attention head that resolves the dependency.
+
+\section{Background}
+
+\subsection{Disambiguation Lag and Landauer Scaling}
+
+In the $(B, z) \to A$ task \citep{sahasrabudhe2026late}, a transformer receives a base string $B$ (6 characters), a selector $z$ (2 characters), and must predict a target string $A$ (4 characters). Each $B$ maps to $K$ different targets, with $z$ determining which one. The key finding: the model first learns $P(A \mid B)$ (the marginal, averaging over all $K$ candidates), producing a loss plateau near $\log K$. It then undergoes a phase transition where it ``discovers'' $z$, and the loss drops to near zero. The cumulative gradient dissipation during this transition scales linearly with $\log K$ ($R^2 = 0.958$), analogous to Landauer's bound on the thermodynamic cost of information erasure.
+
+\subsection{Raga Music: Hierarchical Structure}
+
+A Raga defines a melodic grammar over a 7-note vocabulary (with altered variants):
+\begin{itemize}[nosep]
+    \item \textbf{Swaras}: Sa, Re/re, Ga/ga, Ma/Ma$'$, Pa, Dha/dha, Ni/ni (uppercase = natural, lowercase = flat, prime = sharp).
+    \item \textbf{Aroha/Avaroha}: Permitted ascending/descending note sequences. May skip notes or use zigzag (\emph{vakra}) patterns.
+    \item \textbf{Vadi/Samvadi}: Emphasized notes, analogous to tonic/dominant.
+    \item \textbf{Pakad}: Characteristic phrases (4--7 notes) that establish the Raga's identity.
+\end{itemize}
+
+We focus on a near-pair: \textbf{Bhimpalasi} (vadi = Ma, straight aroha Sa--ga--Ma--Pa--ni--Sa$^*$) and \textbf{Patadeep} (vadi = Pa, vakra aroha Sa--Re--ga--Ma--Pa--\emph{ga}--Ma--dha--ni--Sa$^*$). They share the same swaras and the same avaroha (Sa$^*$--ni--dha--Pa--Ma--ga--Re--Sa), differing only in aroha structure, vadi emphasis, and pakad phrases.
+
+\section{Tokenization and Model Architecture}
+
+\subsection{Token Vocabulary}
+
+We use an atomic swara-level tokenizer with 40 tokens: 12 swaras per octave $\times$ 3 octaves (mandra, madhya, taar) $+$ 4 special tokens (\texttt{PAD}, \texttt{BOS}, \texttt{EOS}, \texttt{SEP}). Each swara is an indivisible token with no sub-token information leakage. The komal/shuddha/tivra distinction is encoded in the token identity (e.g., \texttt{ga} vs.\ \texttt{Ga}).
+
+\subsection{Model}
+
+All experiments use a 4-layer decoder-only transformer with $d_\text{model} = 128$, 4 attention heads ($d_\text{head} = 32$), $d_\text{MLP} = 512$, GeLU activations, and learned positional embeddings. Total parameters: 813,096. We use TransformerLens \citep{nanda2022transformerlens} for mechanistic interpretability hooks. Training uses AdamW with constant learning rate $\eta = 10^{-3}$, weight decay 0.01, batch size 128, and gradient clipping at norm 1.0.
+
+\section{Phase 1: Hierarchical Generator, Markovian Output}
+
+\subsection{Generator Design}
+
+The Phase~1 generator produces sequences of 64 swaras using a hierarchical phrase grammar:
+\begin{equation*}
+    \text{Sequence} = [\text{Phrase}]^+ \quad \text{where Phrase} \in \{\text{Pakad}, \text{Aroha}, \text{Avaroha}, \text{Free}\}
+\end{equation*}
+Phrase selection follows weights $(0.20, 0.05, 0.15, 0.60)$ for (pakad, aroha, avaroha, free movement), tuned via a sweep over configurations to minimize the bigram KL divergence between the near-pair while preserving phrase-level identity signal (see Section~\ref{sec:bigram_kl}). Every sequence is guaranteed to contain at least one pakad phrase.
+
+Free movement uses a weighted random walk over the Raga's swaras, with step probabilities biased toward neighbors ($\pm 1$: weight 4.0, $\pm 2$: weight 2.0) and vadi/samvadi emphasis (vadi $\times 1.5$, samvadi $\times 1.2$).
+
+\subsection{Pre-Training Diagnostic: Bigram KL}
+\label{sec:bigram_kl}
+
+Before training, we sampled 200,000 tokens from each Raga's generator and computed empirical bigram transition matrices. Table~\ref{tab:bigram_kl} shows the symmetric bigram KL divergence between all Raga pairs.
+
+\begin{table}[H]
+\centering
+\caption{Symmetric bigram KL divergence (nats) between Raga generators. Near-pair (Bhimpalasi--Patadeep) has low KL; far-pair (Yaman--Bhairavi) is trivially distinguishable.}
+\label{tab:bigram_kl}
+\begin{tabular}{lcc}
+\toprule
+Pair & Unigram KL & Bigram KL \\
+\midrule
+Bhimpalasi vs.\ Patadeep (near) & 0.021 & 0.093 \\
+Bhimpalasi vs.\ Yaman (far) & 15.35 & 8.02 \\
+Yaman vs.\ Bhairavi (far) & 18.72 & 6.98 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The near-pair bigram KL of 0.093~nats is low but non-zero. Over a 64-token sequence (${\sim}63$ bigrams), the cumulative distinguishing information is ${\sim}5.9$~nats---enough to partially identify the Raga from surface statistics, but insufficient for confident single-sequence classification from bigrams alone.
+
+The most divergent bigrams are aroha-driven: Pa$\to$ni (0.36 vs.\ 0.06 in Bhimpalasi vs.\ Patadeep), Pa$\to$ga (0.07 vs.\ 0.34), and Sa$\to$ga (0.39 vs.\ 0.12). These reflect the different ascending structures of the two Ragas.
+
+\subsection{Training Results}
+
+We trained on 10,000 sequences (5,000 per Raga), shuffled with no Raga labels. Training ran for 50,000 steps. Final loss: 0.312~nats; final accuracy: 88.1\%.
+
+\textbf{Per-Raga loss trajectories.} Bhimpalasi and Patadeep losses dropped in near-perfect lockstep throughout training (Table~\ref{tab:phase1_loss}). The gap oscillated between 0.004 and 0.042~nats with no trend or divergence. A Mann-Whitney U test on per-token loss distributions detected statistical significance ($p < 0.001$) at most checkpoints, but Cohen's $d$ never exceeded 0.10 (maximum: $d = 0.070$ at step 8200). The per-token loss distributions between Ragas are statistically distinguishable but the effect is negligibly small.
+
+\begin{table}[H]
+\centering
+\caption{Phase 1 training trajectory. Per-Raga losses track in lockstep.}
+\label{tab:phase1_loss}
+\begin{tabular}{rcccc}
+\toprule
+Step & Overall Loss & Bhimpalasi & Patadeep & $|\Delta|$ \\
+\midrule
+50 & 1.672 & 1.650 & 1.659 & 0.009 \\
+5,000 & 0.782 & 0.744 & 0.737 & 0.006 \\
+10,000 & 0.555 & 0.497 & 0.467 & 0.030 \\
+25,000 & 0.388 & 0.332 & 0.337 & 0.004 \\
+50,000 & 0.312 & 0.264 & 0.266 & 0.002 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Shuffle diagnostic.} At each checkpoint, we replaced pakad phrases with those from the other Raga (cross-Raga shuffle) and measured loss on the 5 subsequent tokens. We also replaced with a different pakad from the \emph{same} Raga (within-Raga control). The signal $= \text{cross} - \text{control}$ measures Raga-specific phrase binding.
+
+\begin{table}[H]
+\centering
+\caption{Shuffle diagnostic results (Phase 1). Signal grows monotonically; no phase transition.}
+\label{tab:phase1_shuffle}
+\begin{tabular}{rcccc}
+\toprule
+Step & Cross $\Delta$ & Control $\Delta$ & Signal & Partial $\Delta$ \\
+\midrule
+200 & 0.029 & 0.007 & 0.022 & 0.298 \\
+10,200 & 3.617 & 2.840 & 0.777 & 4.062 \\
+30,200 & 5.523 & 4.431 & 1.092 & 6.511 \\
+50,000 & 6.291 & 5.112 & 1.179 & 7.410 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two observations are critical. First, the signal grows \emph{monotonically}---there is no plateau-then-jump pattern, no phase transition. The model gradually learns to distinguish the two Raga-specific Markov chains. Second, the partial shuffle (replacing only free-movement segments, not pakads) produces a \emph{larger} delta than the pakad shuffle (7.41 vs.\ 6.29~nats at step 50,000). The model distinguishes the Ragas primarily from the Markov chain statistics of free movement (vadi weighting, neighbor transitions), not from phrase-level identity.
+
+\subsection{Phase 1 Conclusion}
+
+The hierarchical Raga generator produces output that is, to a good approximation, a mixture of two weakly-distinguishable Markov chains. The ``hierarchical structure'' (aroha, avaroha, pakad, vadi rules) exists in the generator code but does not survive into the output distribution as genuine hierarchy. The optimal predictor is a Bayesian mixture identifier feeding into two slightly different transition matrices---a more sophisticated form of Shannon-level statistics, not Kolmogorov-level compression.
+
+This is a useful negative result. It precisely characterizes when hierarchical generator structure does \emph{not} produce hierarchical output: when the generator's phrases (pakad, aroha) create only local multi-token dependencies, and the between-phrase transitions are memoryless (independent of phrase history), the output is Markovian despite the generator being hierarchical.
+
+\section{Phase 2: Non-Markovian Dependencies via Pakad-Response Pairs}
+
+\subsection{Design Rationale}
+
+Phase~1's failure to produce disambiguation lag motivated a redesign with a precise specification: the generator must produce sequences with positions $P$ and $R$ ($R - P > k$ for any reasonable Markov order $k$) such that the optimal prediction at $R$ depends on what happened at $P$, with the tokens between $P$ and $R$ carrying no information about this dependency.
+
+We implement this via \textbf{pakad-response pairs}: each of 4 pakad phrases per Raga maps to a unique 4-token response phrase. The pakad and response are separated by a buffer of 12--18 tokens of uniform-weighted Markov walk (no vadi bias). The structure is:
+\begin{equation*}
+    \cdots \underbrace{[\text{pakad}]}_{z} \underbrace{[\text{buffer}]}_{\text{noise}} \underbrace{[\text{response}]}_{A} \cdots
+\end{equation*}
+
+This directly implements the $(B, z) \to A$ structure: pakad is $z$, buffer is noise, response is $A$. With 4 pakads per Raga $\times$ 2 Ragas $= 8$ total mappings, $K = 8$.
+
+Thirty percent of pakads are ``naked'' (no response follows), preventing the model from using positional counting to predict when a response is coming. Buffer length varies uniformly from 12 to 18 tokens.
+
+The 8 pakad-response mappings are given in Table~\ref{tab:pakad_response}.
+
+\begin{table}[H]
+\centering
+\caption{Pakad-response pair definitions. Each pakad maps deterministically to one response.}
+\label{tab:pakad_response}
+\small
+\begin{tabular}{llll}
+\toprule
+Raga & Pakad & $\to$ & Response \\
+\midrule
+Bhimpalasi & ni Sa ga Ma & $\to$ & Pa dha Pa Ma \\
+Bhimpalasi & Ma Pa ni dha Pa & $\to$ & ga Re Sa Re \\
+Bhimpalasi & ga Ma ga Re Sa & $\to$ & ni dha Pa dha \\
+Bhimpalasi & Pa ni dha Pa Ma & $\to$ & Ma ga Ma Pa \\
+\midrule
+Patadeep & Ma Pa ga Ma ga Re Sa & $\to$ & dha Pa Ma Pa \\
+Patadeep & dha ni dha Pa & $\to$ & ga Ma ga Re \\
+Patadeep & Sa Re ga Re Sa & $\to$ & ni Pa dha ni \\
+Patadeep & Pa ga Ma dha ni Sa$^*$ & $\to$ & Ma ga Re Sa \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Pre-Training Verification: The Non-Markov Bottleneck}
+
+Before training, we generated 100,000 sequences and verified three properties:
+
+\textbf{Bottleneck size.} The marginal loss on response-first-tokens (predicting without knowing which pakad preceded) is 1.559~nats. The oracle loss (conditioning on the pakad identity) is 0.000~nats (deterministic mapping). The bottleneck---the information-theoretic gap that only non-local attention can close---is \textbf{1.559~nats}.
+
+\textbf{$k$-gram bridgeability.} Table~\ref{tab:ngram} shows $k$-gram model losses on response-first-tokens. For $k = 1$ through $k = 5$, the $k$-gram loss is ${\sim}2.2$~nats---\emph{worse} than the marginal, meaning local context actively misleads. No finite-order Markov model can predict the response from the buffer.
+
+\begin{table}[H]
+\centering
+\caption{$k$-gram model losses (nats) by position type. Response-first-tokens are unpredictable from local context; free movement and buffer tokens are not.}
+\label{tab:ngram}
+\begin{tabular}{rcccc}
+\toprule
+$k$ & Response-first & Free movement & Buffer & Gap (resp $-$ oracle) \\
+\midrule
+1 & 1.928 & 1.930 & 1.941 & 1.928 \\
+2 & 2.201 & 1.668 & 1.671 & 2.201 \\
+3 & 2.208 & 1.685 & 1.691 & 2.208 \\
+5 & 2.201 & 1.685 & 1.693 & 2.201 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Buffer cleanliness.} The average pairwise bigram KL between buffer tokens following different pakads is 0.002---effectively zero. The conditional distribution $P(\text{response-first} \mid \text{last-buffer-token})$ has entropy ${\sim}1.54$~nats for all conditioning values, equal to the marginal. No local feature predicts the response.
+
+\subsection{Training Results: The Lag}
+
+We trained on 10,000 sequences for 18,600 steps (training was terminated early after the key dynamics were observed). The model tracks two loss components:
+\begin{itemize}[nosep]
+    \item \textbf{Response-first-token loss}: loss at the first token of each response phrase---the bottleneck position.
+    \item \textbf{Non-response loss}: loss at all other positions (free movement, pakad internals, buffer tokens).
+\end{itemize}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{../outputs/phase2_pakad_response/figures/disambiguation_lag.png}
+    \caption{Phase 2 disambiguation lag. Response-first-token loss (red) starts 0.55~nats above non-response loss (blue) and remains elevated for ${\sim}1500$ steps before crossing over. The marginal floor (1.56~nats, dotted) is the loss a model achieves by ignoring the pakad. The crossover at step ${\sim}2000$ marks the formation of the non-local attention circuit.}
+    \label{fig:lag}
+\end{figure}
+
+The dynamics (Figure~\ref{fig:lag}, Table~\ref{tab:phase2_loss}) show three phases:
+\begin{enumerate}[nosep]
+    \item \textbf{Plateau (steps 0--1500):} Response-first-token loss starts at 2.18~nats and barely moves, while non-response loss drops from 1.63 to 1.47. The model is learning Markovian structure (free movement, aroha/avaroha patterns, buffer transitions) but cannot predict responses because they require non-local attention to the pakad. The gap peaks at +0.62~nats.
+    \item \textbf{Transition (steps 1500--2500):} Response-first-token loss drops rapidly, crossing below non-response loss at step ${\sim}2000$. The attention circuit from response position to pakad position forms during this window.
+    \item \textbf{Exploitation (steps 2500+):} Response-first-token loss reaches 0.15~nats---near zero, reflecting the deterministic pakad$\to$response mapping. Non-response loss continues declining toward its irreducible floor (${\sim}0.38$~nats, set by the stochastic free-movement generator). Response tokens are now the \emph{easiest} positions to predict, despite being the hardest during the plateau.
+\end{enumerate}
+
+\begin{table}[H]
+\centering
+\caption{Phase 2 training trajectory. The gap column shows response-first-token loss minus non-response loss; positive values indicate the lag period.}
+\label{tab:phase2_loss}
+\begin{tabular}{rccccc}
+\toprule
+Step & Overall & Resp-first & Non-resp & Gap & Accuracy \\
+\midrule
+50 & 1.631 & 2.178 & 1.629 & +0.549 & 37.5\% \\
+500 & 1.585 & 2.134 & 1.549 & +0.585 & 40.1\% \\
+1,000 & 1.510 & 1.949 & 1.501 & +0.448 & 43.3\% \\
+1,500 & 1.483 & 1.658 & 1.469 & +0.189 & 43.7\% \\
+2,000 & 1.449 & 1.484 & 1.433 & +0.051 & 45.2\% \\
+2,500 & 1.371 & 1.410 & 1.365 & +0.045 & 48.0\% \\
+3,000 & 1.262 & 0.986 & 1.257 & $-$0.271 & 52.5\% \\
+5,000 & 0.889 & 0.570 & 0.822 & $-$0.252 & 66.4\% \\
+10,000 & 0.533 & 0.237 & 0.486 & $-$0.249 & 80.3\% \\
+18,600 & 0.419 & 0.150 & 0.372 & $-$0.222 & 84.2\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{../outputs/phase2_pakad_response/figures/lag_gap.png}
+    \caption{Gap between response-first-token loss and non-response loss over training. Red shading indicates the lag period (response lagging); blue shading indicates the exploitation period (response leading). The transition from lag to exploitation occurs between steps 1500--2500.}
+    \label{fig:gap}
+\end{figure}
+
+\subsection{Mechanistic Analysis: The Attention Circuit}
+
+Using TransformerLens, we extracted attention patterns at 19 checkpoints spanning the training run. At each checkpoint, we measured how much attention flows from response-first-token positions to three source regions: pakad tokens, buffer tokens, and all other tokens.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{../outputs/phase2_pakad_response/figures/attention_to_pakad.png}
+    \caption{Total attention from response positions to pakad tokens (left) and buffer tokens (right), by layer. Layer~3 shows the largest increase in pakad attention, coinciding with the transition period.}
+    \label{fig:attn_layer}
+\end{figure}
+
+\textbf{Layer 3, Head 1 is the disambiguation circuit.} This head's attention to pakad tokens increases from 0.42 at step 200 to 0.68 by step 1200---the largest change of any head (+0.24). The timing aligns precisely with the loss transition: the circuit forms between steps 200--1200, and the response-first-token loss begins dropping at step ${\sim}1000$.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{../outputs/phase2_pakad_response/figures/attention_heatmap.png}
+    \caption{Attention to pakad from response positions, per head over training. L3H1 (the bright band) shows the strongest and earliest increase.}
+    \label{fig:attn_heatmap}
+\end{figure}
+
+\begin{table}[H]
+\centering
+\caption{Attention to pakad from response positions: all heads sorted by change from step 400 to step 18,600. L3H1 dominates; L0H2 \emph{decreases} as it specializes toward local buffer context.}
+\label{tab:attention_heads}
+\begin{tabular}{lcccc}
+\toprule
+Head & Before (step 400) & After (step 18,600) & Change & Role \\
+\midrule
+L3H1 & 0.422 & 0.662 & +0.240 & Disambiguation circuit \\
+L0H0 & 0.142 & 0.286 & +0.144 & Supporting \\
+L2H3 & 0.181 & 0.317 & +0.137 & Supporting \\
+L3H3 & 0.205 & 0.340 & +0.135 & Supporting \\
+\midrule
+L1H2 & 0.062 & 0.028 & $-$0.034 & \multirow{2}{*}{Specializing to local context} \\
+L0H2 & 0.102 & 0.044 & $-$0.059 & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A complementary pattern emerges: while L3H1 increases pakad attention, L0H2 \emph{decreases} its pakad attention ($-$0.06) while maintaining high buffer attention (0.88 throughout). As the model develops the non-local disambiguation circuit in Layer~3, Layer~0 specializes toward local context processing---a division of labor between local (Markovian) and non-local (disambiguation) computation.
+
+\section{Discussion}
+
+\subsection{The Hierarchy Question: Resolved Negatively}
+
+The original motivation for the Raga substrate was to test whether transformers learn hierarchical rule systems (swaras $\to$ phrases $\to$ Raga identity) in a staged fashion, transitioning from Shannon-level statistics to Kolmogorov-level compression. Phase~1 provides a definitive answer: \textbf{they do not}, because the generator's hierarchical rules do not produce hierarchical output.
+
+This negative result has a precise characterization. A hierarchical generator produces Markovian output when:
+\begin{enumerate}[nosep]
+    \item Phrase-internal transitions are locally predictable (each token depends primarily on its immediate predecessor).
+    \item Between-phrase transitions are memoryless (which phrase comes next is independent of phrase history).
+    \item The latent variable (Raga identity) manifests only as a constant shift in transition probabilities (vadi weighting), not as a state-dependent interaction.
+\end{enumerate}
+
+All three conditions hold for the Phase~1 generator. The implication is that testing hierarchical rule discovery requires generators whose output has \emph{provably non-Markovian} structure---long-range dependencies that no finite-order Markov model can capture.
+
+\subsection{Disambiguation Lag: Confirmed as General}
+
+Phase~2 reproduces disambiguation lag in a substrate that differs from the original $(B, z) \to A$ task in vocabulary (40 swara tokens vs.\ 36 alphanumeric), sequence structure (hierarchical phrase grammar vs.\ concatenated strings), and domain semantics (musical melody vs.\ arbitrary string mapping). Despite these differences, the same three-part pattern appears:
+\begin{enumerate}[nosep]
+    \item \textbf{Plateau}: The bottleneck tokens (response-first) lag behind all other tokens for ${\sim}1500$ steps.
+    \item \textbf{Transition}: A single attention head (L3H1) wires up the non-local circuit, and response-first-token loss drops rapidly.
+    \item \textbf{Exploitation}: Response tokens become the easiest to predict (0.15~nats vs.\ 0.38 for free movement), because the pakad$\to$response mapping is deterministic once the circuit is active.
+\end{enumerate}
+
+The lag duration (${\sim}1500$ steps) is in the same order of magnitude as the $K = 5$ condition in the original experiment (${\sim}500$ steps), consistent with the larger effective $K = 8$ in Phase~2 and the different sequence structure providing fewer bottleneck tokens per training step.
+
+\subsection{What the Raga Substrate Adds}
+
+Despite the negative Phase~1 result, the Raga substrate contributes three things beyond the original synthetic task:
+
+\textbf{Ecological validity of the bottleneck.} The non-local dependency in Phase~2 has a musically meaningful interpretation: a pakad phrase establishes a melodic context that shapes what follows. While our implementation is more rigid than real Raga performance (deterministic response vs.\ probabilistic stylistic influence), the structure---identity phrase $\to$ intervening material $\to$ consequent phrase---is a genuine pattern in Indian classical music.
+
+\textbf{Natural irreducible floor.} Unlike the original task where the model can achieve zero loss, the Raga substrate has an irreducible entropy floor set by the stochastic free-movement generator (${\sim}0.38$~nats). This cleanly separates the two learning regimes: response tokens (deterministic, loss $\to 0$) and free-movement tokens (stochastic, loss $\to$ floor).
+
+\textbf{Division of labor.} The attention analysis reveals that the model partitions its circuits: L3H1 handles non-local disambiguation while L0H2 handles local context. This specialization is more visible here than in the original task because the Raga substrate has a richer local structure (melodic transitions) that benefits from dedicated local-context heads.
+
+\subsection{Limitations}
+
+\textbf{Phase~2's non-Markovian dependency is engineered, not emergent.} We explicitly constructed pakad-response pairs to create a bottleneck. Real Raga music does not have such rigid mappings. Whether natural musical sequences contain non-Markovian structure that would produce disambiguation lag remains an open question.
+
+\textbf{No K-scaling test.} We tested a single $K = 8$ condition. The Landauer scaling prediction---that lag duration scales as $\log K$---requires sweeping $K \in \{4, 8, 16, 24\}$ by adding more Ragas and pakad-response pairs. This is straightforward but was not performed in this initial study.
+
+\textbf{Single seed, single architecture.} All results use seed 42 on a single 813K-parameter model. Robustness across seeds and model sizes is untested.
+
+\textbf{No held-out evaluation.} The model trains on all generated sequences with no train/test split. Per-position loss and attention analyses are computed on training data. This is acceptable for studying learning dynamics (which are the object of interest) but means generalization performance is unknown.
+
+\section{Conclusion}
+
+Disambiguation lag---the delayed learning of non-local disambiguating information---is not an artifact of the synthetic $(B, z) \to A$ task. It appears in a musical substrate with a different vocabulary, different sequence structure, and different domain semantics, provided the substrate contains a genuine non-Markovian dependency. The lag manifests as a ${\sim}1500$-step plateau on response-first-tokens, resolves when a single attention head (L3H1) builds the non-local circuit, and produces a clean division of labor between local-context and disambiguation heads.
+
+Equally important is the negative result: a hierarchical generative grammar does not automatically produce output requiring hierarchical representations. When a generator's rules create only local dependencies and memoryless between-phrase transitions, the output is a mixture of Markov chains, learnable smoothly without any phase transition. Testing hierarchical rule discovery requires generators whose output is provably non-Markovian---a stronger condition than having hierarchical generation rules.
+
+\section*{Code and Data Availability}
+
+All code, configurations, and analysis scripts are available at \url{https://github.com/mihirs-0/raga-lm}.
+
+\bibliographystyle{plainnat}
+\begin{thebibliography}{9}
+
+\bibitem[Sahasrabudhe(2026)]{sahasrabudhe2026late}
+Mihir Sahasrabudhe.
+\newblock Late disambiguation lag: A mechanistic analysis.
+\newblock GitHub repository, 2026.
+
+\bibitem[Nanda and Bloom(2022)]{nanda2022transformerlens}
+Neel Nanda and Joseph Bloom.
+\newblock TransformerLens.
+\newblock \url{https://github.com/TransformerLensOrg/TransformerLens}, 2022.
+
+\end{thebibliography}
+
+\end{document}
